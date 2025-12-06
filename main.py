@@ -65,7 +65,8 @@ def load_data():
         "secret_key": "1234",  # Ключ по умолчанию
         "video_url": "https://youtube.com",  # Ссылка на видео по умолчанию
         "total_users": 0,
-        "successful_keys": 0
+        "successful_keys": 0,
+        "pending_notifications": []  # Очередь рассылки
     }
 
 def save_data(data):
