@@ -2,6 +2,7 @@ import asyncio
 import logging
 import json
 import os
+import time
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -105,6 +106,61 @@ async def check_subscription(user_id: int) -> bool:
         logging.error(f"Ошибка при проверке подписки: {e}")
         # Если бот не админ канала, он не сможет проверить подписку
         return False
+
+# ==========================================
+# ФОНОВАЯ ЗАДАЧА: РАССЫЛКА
+# ==========================================
+async def notification_worker():
+    """Проверяет очередь и отправляет сообщения"""
+    print("[WORKER] Запущен процесс проверки рассылок...")
+    while True:
+        try:
+            current_time = time.time()
+            # Копируем список, чтобы безопасно удалять из оригинала
+            # Используем get() для безопасности, если поле еще не создано
+            notifications = bot_data.get("pending_notifications", [])
+            remaining_notifications = []
+            
+            data_changed = False
+            
+            for note in notifications:
+                if current_time >= note["send_time"]:
+                    # Время пришло! Отправляем сообщение
+                    user_id = note["user_id"]
+                    try:
+                        builder = InlineKeyboardBuilder()
+                        builder.button(text="💰 Купить голду", url="https://t.me/gamecourse_golda_bot?start=98")
+                        
+                        await bot.send_message(
+                            chat_id=user_id,
+                            text=(
+                                "⏳ <b>Ты успел купить голду за 10 рублей?</b>\n\n"
+                                "Завтра уже не будет такой возможности! 😱\n"
+                                "<b>Сегодня последний день акции.</b>"
+                            ),
+                            reply_markup=builder.as_markup(),
+                            parse_mode=ParseMode.HTML
+                        )
+                        print(f"[WORKER] Отправлено напоминание пользователю {user_id}")
+                    except Exception as e:
+                        # Если пользователь заблокировал бота, просто логируем
+                        print(f"[WORKER] Ошибка отправки {user_id}: {e}")
+                    
+                    # Не добавляем в remaining_notifications -> удаляем из очереди
+                    data_changed = True
+                else:
+                    # Время еще не пришло, оставляем
+                    remaining_notifications.append(note)
+            
+            if data_changed:
+                bot_data["pending_notifications"] = remaining_notifications
+                save_data(bot_data)
+                
+        except Exception as e:
+            logging.error(f"[WORKER] Ошибка в цикле рассылки: {e}")
+            
+        # Проверяем каждые 5 секунд
+        await asyncio.sleep(5)
 
 # ==========================================
 # ПРОВЕРКА АДМИНА
@@ -245,6 +301,20 @@ async def process_key_input(message: types.Message, state: FSMContext):
     if user_key == bot_data["secret_key"]:
         await state.clear()
         bot_data["successful_keys"] = bot_data.get("successful_keys", 0) + 1
+        
+        # ДОБАВЛЯЕМ В ОЧЕРЕДЬ РАССЫЛКИ (ТЕСТ: 10 СЕКУНД)
+        # Потом заменить 10 на 600 (10 минут)
+        send_time = time.time() + 10
+        
+        # Инициализируем список, если его нет
+        if "pending_notifications" not in bot_data:
+            bot_data["pending_notifications"] = []
+            
+        bot_data["pending_notifications"].append({
+            "user_id": message.from_user.id,
+            "send_time": send_time
+        })
+        
         save_data(bot_data)
         
         builder = InlineKeyboardBuilder()
@@ -519,6 +589,10 @@ async def main():
     print("[BOT] Бот запущен...")
     # Удаляем вебхуки и запускаем поллинг
     await bot.delete_webhook(drop_pending_updates=True)
+    
+    # Запускаем фоновую задачу рассылки параллельно с ботом
+    asyncio.create_task(notification_worker())
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
