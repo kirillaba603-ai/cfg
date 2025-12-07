@@ -66,7 +66,8 @@ def load_data():
         "video_url": "https://youtube.com",  # Ссылка на видео по умолчанию
         "total_users": 0,
         "successful_keys": 0,
-        "pending_notifications": []  # Очередь рассылки
+        "pending_notifications": [],  # Очередь рассылки (дожим после конфига)
+        "pending_video_reminders": []  # Напоминание посмотреть видео
     }
 
 def save_data(data):
@@ -112,21 +113,19 @@ async def check_subscription(user_id: int) -> bool:
 # ФОНОВАЯ ЗАДАЧА: РАССЫЛКА
 # ==========================================
 async def notification_worker():
-    """Проверяет очередь и отправляет сообщения"""
+    """Проверяет очереди и отправляет сообщения"""
     print("[WORKER] Запущен процесс проверки рассылок...")
     while True:
         try:
             current_time = time.time()
-            # Копируем список, чтобы безопасно удалять из оригинала
-            # Используем get() для безопасности, если поле еще не создано
+            data_changed = False
+            
+            # ========== ОЧЕРЕДЬ 1: ДОЖИМ ПОСЛЕ КОНФИГА (5 мин) ==========
             notifications = bot_data.get("pending_notifications", [])
             remaining_notifications = []
             
-            data_changed = False
-            
             for note in notifications:
                 if current_time >= note["send_time"]:
-                    # Время пришло! Отправляем сообщение
                     user_id = note["user_id"]
                     try:
                         builder = InlineKeyboardBuilder()
@@ -142,19 +141,48 @@ async def notification_worker():
                             reply_markup=builder.as_markup(),
                             parse_mode=ParseMode.HTML
                         )
-                        print(f"[WORKER] Отправлено напоминание пользователю {user_id}")
+                        print(f"[WORKER] Дожим отправлен пользователю {user_id}")
                     except Exception as e:
-                        # Если пользователь заблокировал бота, просто логируем
-                        print(f"[WORKER] Ошибка отправки {user_id}: {e}")
-                    
-                    # Не добавляем в remaining_notifications -> удаляем из очереди
+                        print(f"[WORKER] Ошибка отправки дожима {user_id}: {e}")
                     data_changed = True
                 else:
-                    # Время еще не пришло, оставляем
                     remaining_notifications.append(note)
             
             if data_changed:
                 bot_data["pending_notifications"] = remaining_notifications
+            
+            # ========== ОЧЕРЕДЬ 2: НАПОМИНАНИЕ ПРО ВИДЕО (30 мин) ==========
+            video_reminders = bot_data.get("pending_video_reminders", [])
+            remaining_video_reminders = []
+            
+            for reminder in video_reminders:
+                if current_time >= reminder["send_time"]:
+                    user_id = reminder["user_id"]
+                    try:
+                        builder = InlineKeyboardBuilder()
+                        builder.button(text="🎬 Смотреть видео", url=bot_data["video_url"])
+                        builder.button(text="🔑 Ввести ключ", callback_data="enter_key")
+                        
+                        await bot.send_message(
+                            chat_id=user_id,
+                            text=(
+                                "👀 <b>Ты посмотрел видео?</b>\n\n"
+                                "Чтобы получить лучший конфиг и апнуть легенду за 3 дня — "
+                                "введи ключ из видео! 🎮\n\n"
+                                "<b>Не упусти возможность!</b>"
+                            ),
+                            reply_markup=builder.as_markup(),
+                            parse_mode=ParseMode.HTML
+                        )
+                        print(f"[WORKER] Напоминание про видео отправлено {user_id}")
+                    except Exception as e:
+                        print(f"[WORKER] Ошибка отправки напоминания {user_id}: {e}")
+                    data_changed = True
+                else:
+                    remaining_video_reminders.append(reminder)
+            
+            if data_changed:
+                bot_data["pending_video_reminders"] = remaining_video_reminders
                 save_data(bot_data)
                 
         except Exception as e:
@@ -176,9 +204,47 @@ def is_admin(user_id: int) -> bool:
 async def cmd_start(message: types.Message, state: FSMContext):
     global bot_data
     bot_data["total_users"] = bot_data.get("total_users", 0) + 1
-    save_data(bot_data)
     
+    user_id = message.from_user.id
     await state.clear()
+    
+    # СНАЧАЛА ПРОВЕРЯЕМ ПОДПИСКУ
+    is_subscribed = await check_subscription(user_id)
+    
+    if not is_subscribed:
+        # НЕ ПОДПИСАН - показываем экран подписки
+        builder = InlineKeyboardBuilder()
+        builder.row(
+            InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_URL)
+        )
+        builder.row(
+            InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")
+        )
+        
+        await message.answer(
+            "👋 <b>Привет!</b>\n\n"
+            "Чтобы получить конфиг, сначала подпишись на наш канал:\n\n"
+            f"📢 <b>Канал:</b> {CHANNEL_ID}\n\n"
+            "После подписки нажми кнопку ниже 👇",
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # ПОДПИСАН - показываем основное меню
+    # Добавляем в очередь напоминания про видео
+    if "pending_video_reminders" not in bot_data:
+        bot_data["pending_video_reminders"] = []
+    
+    already_in_queue = any(r["user_id"] == user_id for r in bot_data["pending_video_reminders"])
+    
+    if not already_in_queue:
+        bot_data["pending_video_reminders"].append({
+            "user_id": user_id,
+            "send_time": time.time() + 1800  # 30 минут
+        })
+    
+    save_data(bot_data)
     
     builder = InlineKeyboardBuilder()
     builder.row(
@@ -190,6 +256,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     
     await message.answer(
         "👋 <b>Привет!</b>\n\n"
+        "🎉 Спасибо за подписку!\n\n"
         "Чтобы получить конфиг, тебе нужно:\n"
         "1️⃣ Посмотреть видео и найти <b>4-значный ключ</b>\n"
         "2️⃣ Ввести ключ и получить конфиг\n\n"
@@ -197,6 +264,69 @@ async def cmd_start(message: types.Message, state: FSMContext):
         reply_markup=builder.as_markup(),
         parse_mode=ParseMode.HTML
     )
+
+# ==========================================
+# ПРОВЕРКА ПОДПИСКИ (callback)
+# ==========================================
+@dp.callback_query(F.data == "check_sub")
+async def check_sub_callback(callback: types.CallbackQuery):
+    global bot_data
+    user_id = callback.from_user.id
+    is_subscribed = await check_subscription(user_id)
+    
+    if not is_subscribed:
+        # ВСЁ ЕЩЁ НЕ ПОДПИСАН
+        builder = InlineKeyboardBuilder()
+        builder.row(
+            InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_URL)
+        )
+        builder.row(
+            InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")
+        )
+        
+        await callback.message.edit_text(
+            "❌ <b>Ты ещё не подписался!</b>\n\n"
+            f"Подпишись на канал: {CHANNEL_ID}\n\n"
+            "После подписки нажми кнопку ниже 👇",
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.HTML
+        )
+        await callback.answer("❌ Подписка не найдена!", show_alert=True)
+        return
+    
+    # ПОДПИСАН - показываем основное меню
+    # Добавляем в очередь напоминания про видео
+    if "pending_video_reminders" not in bot_data:
+        bot_data["pending_video_reminders"] = []
+    
+    already_in_queue = any(r["user_id"] == user_id for r in bot_data["pending_video_reminders"])
+    
+    if not already_in_queue:
+        bot_data["pending_video_reminders"].append({
+            "user_id": user_id,
+            "send_time": time.time() + 1800
+        })
+    
+    save_data(bot_data)
+    
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="🎬 Видео с ключом", callback_data="show_video")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔑 Ввести ключ", callback_data="enter_key")
+    )
+    
+    await callback.message.edit_text(
+        "🎉 <b>Спасибо за подписку!</b>\n\n"
+        "Чтобы получить конфиг, тебе нужно:\n"
+        "1️⃣ Посмотреть видео и найти <b>4-значный ключ</b>\n"
+        "2️⃣ Ввести ключ и получить конфиг\n\n"
+        "👇 Выбери действие:",
+        reply_markup=builder.as_markup(),
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer("✅ Подписка подтверждена!")
 
 # ==========================================
 # КНОПКА "ВИДЕО С КЛЮЧОМ"
@@ -226,6 +356,30 @@ async def show_video(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "back_to_start")
 async def back_to_start(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
+    user_id = callback.from_user.id
+    
+    # Проверяем подписку при возврате
+    is_subscribed = await check_subscription(user_id)
+    
+    if not is_subscribed:
+        # ВСЁ ЕЩЁ НЕ ПОДПИСАН
+        builder = InlineKeyboardBuilder()
+        builder.row(
+            InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_URL)
+        )
+        builder.row(
+            InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")
+        )
+        
+        await callback.message.edit_text(
+            "❌ <b>Ты отписался от канала!</b>\n\n"
+            f"Подпишись снова: {CHANNEL_ID}\n\n"
+            "После подписки нажми кнопку ниже 👇",
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.HTML
+        )
+        await callback.answer()
+        return
     
     builder = InlineKeyboardBuilder()
     builder.row(
@@ -303,17 +457,22 @@ async def process_key_input(message: types.Message, state: FSMContext):
         await state.clear()
         bot_data["successful_keys"] = bot_data.get("successful_keys", 0) + 1
         
-        # ДОБАВЛЯЕМ В ОЧЕРЕДЬ РАССЫЛКИ (ТЕСТ: 10 СЕКУНД)
-        # Потом заменить 10 на 600 (10 минут)
-        send_time = time.time() + 10
+        user_id = message.from_user.id
         
-        # Инициализируем список, если его нет
+        # УДАЛЯЕМ ИЗ ОЧЕРЕДИ НАПОМИНАНИЯ ПРО ВИДЕО (он уже ввел ключ)
+        if "pending_video_reminders" in bot_data:
+            bot_data["pending_video_reminders"] = [
+                r for r in bot_data["pending_video_reminders"] 
+                if r["user_id"] != user_id
+            ]
+        
+        # ДОБАВЛЯЕМ В ОЧЕРЕДЬ ДОЖИМА (5 минут = 300 сек)
         if "pending_notifications" not in bot_data:
             bot_data["pending_notifications"] = []
             
         bot_data["pending_notifications"].append({
-            "user_id": message.from_user.id,
-            "send_time": send_time
+            "user_id": user_id,
+            "send_time": time.time() + 300
         })
         
         save_data(bot_data)
@@ -584,6 +743,83 @@ async def cmd_stats(message: types.Message):
         f"🎬 Видео: {bot_data['video_url']}",
         parse_mode=ParseMode.HTML
     )
+
+# ==========================================
+# АВТОПРОВЕРКА КЛЮЧА (если пишут 4 цифры)
+# ==========================================
+@dp.message(F.text.regexp(r'^\d{4}$'))
+async def auto_check_key(message: types.Message, state: FSMContext):
+    """Автоматически проверяет ключ, если пользователь пишет 4 цифры"""
+    global bot_data
+    
+    # Проверяем, не находится ли пользователь в состоянии ввода ключа
+    # (чтобы не дублировать обработку)
+    current_state = await state.get_state()
+    if current_state == KeyInput.waiting_for_key.state:
+        return  # Пусть обрабатывает process_key_input
+    
+    # Проверяем, не админ ли это в состоянии ввода нового ключа
+    if current_state == AdminStates.waiting_for_new_key.state:
+        return
+    
+    user_key = message.text.strip()
+    user_id = message.from_user.id
+    
+    # Проверяем подписку
+    is_subscribed = await check_subscription(user_id)
+    if not is_subscribed:
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="📢 Подписаться", url=CHANNEL_URL))
+        builder.row(InlineKeyboardButton(text="🔑 Ввести ключ", callback_data="enter_key"))
+        
+        await message.answer(
+            "❌ <b>Сначала подпишись на канал!</b>\n\n"
+            f"Канал: {CHANNEL_ID}",
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    if user_key == bot_data["secret_key"]:
+        bot_data["successful_keys"] = bot_data.get("successful_keys", 0) + 1
+        
+        # УДАЛЯЕМ ИЗ ОЧЕРЕДИ НАПОМИНАНИЯ ПРО ВИДЕО
+        if "pending_video_reminders" in bot_data:
+            bot_data["pending_video_reminders"] = [
+                r for r in bot_data["pending_video_reminders"] 
+                if r["user_id"] != user_id
+            ]
+        
+        # ДОБАВЛЯЕМ В ОЧЕРЕДЬ ДОЖИМА (5 минут)
+        if "pending_notifications" not in bot_data:
+            bot_data["pending_notifications"] = []
+            
+        bot_data["pending_notifications"].append({
+            "user_id": user_id,
+            "send_time": time.time() + 300
+        })
+        
+        save_data(bot_data)
+        
+        builder = InlineKeyboardBuilder()
+        builder.button(text="💰 Голда за 10 рублей", url="https://t.me/gamecourse_golda_bot?start=98")
+        
+        await message.answer(
+            "✅ <b>Ключ верный!</b>\n\n" + CONFIG_TEXT,
+            parse_mode=ParseMode.HTML,
+            reply_markup=builder.as_markup()
+        )
+    else:
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="🎬 Посмотреть видео", url=bot_data["video_url"]))
+        builder.row(InlineKeyboardButton(text="🔙 В начало", callback_data="back_to_start"))
+        
+        await message.answer(
+            "❌ <b>Неверный ключ!</b>\n\n"
+            "Посмотри видео внимательнее и попробуй снова.",
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.HTML
+        )
 
 # Запуск процесса поллинга (прослушивания обновлений)
 async def main():
